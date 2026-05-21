@@ -402,3 +402,12 @@ User wants exactly 500 ARB
 ```
 
 - `pool.swap`
+  - Big Picture
+  ```
+  The swap engine repeatedly:
+  1. find next initialized tick
+  2. move price toward it
+  3. consume liquidity
+  4. maybe cross tick
+  5. repeat
+  ```
