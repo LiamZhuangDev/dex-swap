@@ -57,6 +57,26 @@
 
 ```
 
+## Core structure
+```
+core/
+ ├── UniswapV3Pool.sol
+ ├── UniswapV3Factory.sol
+ ├── libraries/
+ │    ├── Tick.sol
+ │    ├── TickMath.sol
+ │    ├── SwapMath.sol
+ │    ├── SqrtPriceMath.sol
+ │    ├── LiquidityMath.sol
+ │    └── Oracle.sol
+ │
+periphery/
+ ├── SwapRouter.sol
+ ├── NonfungiblePositionManager.sol
+ ├── Quoter.sol
+ └── libraries/
+```
+
 ## Important Concepts
 ### `Tick`
 The smallest possible upward or downward price movement of a traded asset.
@@ -157,3 +177,228 @@ So `x = L / sqrt(p), y = L * sqrt(p)`
 - When moving the current price p to p_b, token0 will be eventually used. That means `delta_x = L_0 / sqrt(p) - L_0 / sqrt(p_b)`. So **`L_0 = delta_x * sqrt(p) * sqrt(p_b) / (sqrt(p_b) - sqrt(p))`**
 - When moving the current pice p to p_a, token1 will be used up. Thus `delta_y = L_1 * sqrt(p) - L_1 * sqrt(p_a)`. So **`L_1 = delta_y / (sqrt(p) - sqrt(p_a))`**
 - The liquidity **`L = min(L_0, L_1)`**
+
+### `LP Position`
+```
+Alice:
+ETH/USDC
+tickLower = 200000
+tickUpper = 210000
+liquidity = 1000
+```
+### `Swap direction`
+Inside V3 pools:
+- price = token1 / token0
+- token0 is the token with smaller address
+- token1 is the token with larger address
+
+Swap direction is determined by `is tokenIn the smaller-address token?` 
+- If yes, tokenIn is token0, so swap token0 -> token1. 
+- Otherwise tokenIn is token1, swap token1 -> token0.
+
+## `Create Liquidity`
+```
+LP
+ │
+ │ mint()
+ ▼
+PositionManager
+ │
+ │ addLiquidity() - calculate liquidity L = min(L0, L1)
+ ▼
+PositionManager
+ │
+ │ pool.mint()
+ ▼
+Pool
+ │
+ │ "pay me tokens"
+ │ callback
+ ▼
+PositionManager.uniswapV3MintCallback()
+ │
+ │ transferFrom(LP → Pool)
+ ▼
+ERC20 token contract
+ │
+ ▼
+Pool receives tokens
+ │
+ ▼
+liquidity activated
+ │
+ │ ERC721._mint()
+ ▼
+PositionManager
+ │
+ ▼
+NFT → LP
+```
+- The NFT only represents ownership of a position record
+```
+ERC721 NFT
+(tokenId = 42)
+     │
+     │ ownership only
+     ▼
+
+_positions[42]
+{
+    liquidity: 100,
+    tickLower: ...,
+    tickUpper: ...,
+    ...
+}
+```
+## `Increase Liquidity`
+```
+increaseLiquidity()
+    │
+    ├── add liquidity to pool
+    │
+    ├── read latest fee accumulators (fee growth per liquidity unit)
+    │
+    ├── compute pending fees earned so far
+    │
+    ├── store owed/claimable fees
+    │
+    ├── update fee checkpoint
+    │
+    └── increase liquidity amount
+```
+- Pool does NOT track: Alice earned X fees. Instead it tracks: `fee growth per liquidity unit`. This is classic accumulator accounting.
+
+## `Decrease Liquidity`
+```
+decreaseLiquidity()
+    ↓
+tokensOwed updated (withdrawn principal and accumulated fees)
+tokens now claimable (BUT NOT TRANSFERRED)
+    
+Later:
+
+  user 
+    ↓
+collect()
+    ↓
+actual ERC20 transfer
+```
+
+## `_modifyPosition`
+- Almost everything:
+  - mint
+  - burn
+  - increaseLiquidity
+  - decreaseLiquidity
+- Eventually funnels into: `_modifyPosition()`. Given a liquidity range and liquidity delta, how many token0/token1 are needed?
+  ```
+  _modifyPosition()
+    │
+    ├── validate ticks
+    ├── update fee/tick accounting
+    ├── determine current price region
+    ├── compute token deltas
+    └── update active liquidity
+
+  amount0 = getAmount0Delta(
+    currentPrice,
+    upperPrice,
+    liquidityDelta
+  )
+
+  amount1 = getAmount1Delta(
+    lowerPrice,
+    currentPrice,
+    liquidityDelta
+  )
+  ```
+- At lower bound: `position is all token0`
+- At upper bound: `position is all token1`
+- Between the range: `position is active, both token0 and token1 are needed`
+
+## Swap
+- `SwapRouter` contains following swap methods:
+  - `exactInput`：多池交换，用户指定输入代币数量，尽可能多地获得输出代币；
+  - `exactInputSingle`：单池交换，用户指定输入代币数量，尽可能多地获得输出代币；
+  - `exactOutput`：多池交换，用户指定输出代币数量，尽可能少地提供输入代币；
+  - `exactOutputSingle`：单池交换，用户指定输出代币数量，尽可能少地提供输入代币。
+
+- `exactInput`, this is the multi-hop swap function. It handles swaps like: `USDC -> WETH` or multi-hop: `USDC -> WETH -> ARB`. The key idea is: each swap’s output becomes the next swap’s input.
+  ```
+  while (true) {
+      swap through first pool (calls exactInputInternal)
+      if more pools:
+          continue
+      else:
+          finish
+  }
+  ```
+  So if path is `USDC -> WETH -> ARB`. It does:
+  - Swap USDC to WETH
+  - router temporarily holds WETH
+  - Swap WETH to ARB
+  - send ARB to final recipient
+
+- Payer and recipient could be the same person, that's normal wallet swap. They can also be different people, useful for payments/smart contract integrations/gifting and so on.
+
+- `exactInputInternal`
+```
+Router
+ |
+ | call pool.swap()
+ v
+Pool
+
+Pool computes swap
+
+Pool calls router callback: "pay me 1000 USDC"
+
+Router pulls USDC from payer
+
+Pool sends 0.5 WETH to recipient
+
+Pool returns:
+    amount0 = +1000
+    amount1 = -0.5
+```
+
+- `exactOutput`
+```solidity
+/// @inheritdoc ISwapRouter
+function exactOutput(ExactOutputParams calldata params)
+    external
+    payable
+    override
+    checkDeadline(params.deadline)
+    returns (uint256 amountIn)
+{
+    // it's okay that the payer is fixed to msg.sender here, as they're only paying for the "final" exact output
+    // swap, which happens first, and subsequent swaps are paid for within nested callback frames
+    exactOutputInternal(
+        params.amountOut,
+        params.recipient,
+        0,
+        SwapCallbackData({path: params.path, payer: msg.sender})
+    );
+
+    amountIn = amountInCached;
+    require(amountIn <= params.amountInMaximum, 'Too much requested');
+    amountInCached = DEFAULT_AMOUNT_IN_CACHED;
+}
+```
+
+```
+User wants exactly 500 ARB
+│
+├── swap(WETH -> ARB)
+│     ├── pool sends 500 ARB to Alice
+│     ├── pool figures out 0.52 WETH needed to swap 500 ARB
+│     └── pool calls callback: "Hey router, you own me 0.52 WETH"
+│            └── swap(USDC -> WETH)
+│                 ├── pool sends 0.52 WETH to router
+│                 ├── pool figures out 1032 USDC needed for 0.52 WETH
+│                 └── pool calls callback: "Hey router, you own me 1032 USDC"
+│                       └── pull 1032 USDC from user, set amountInCached to 1032 USDC.
+```
+
+- `pool.swap`
